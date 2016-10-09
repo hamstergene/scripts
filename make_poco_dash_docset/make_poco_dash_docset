@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+
+import logging
+
+def main(parsed_args):
+    import os, os.path, re, shutil, sqlite3, subprocess, sys, textwrap, urllib.parse, urllib.request
+
+    if not parsed_args.poco_html_docs_folder:
+        logging.info("Checking pocoproject.org/documentation ...")
+        website_index_html = urllib.request.urlopen("https://pocoproject.org/documentation/").read().decode("utf-8")
+
+        match = re.search(r'''href="(.*/poco-.*-all-doc\.zip)"''', website_index_html)
+        zip_url = match.group(1)
+        parsed_zip_url = urllib.parse.urlparse(zip_url)
+        zip_filename = os.path.basename(parsed_zip_url.path)
+        folder_name = os.path.splitext(zip_filename)[0]
+
+        if os.path.exists(folder_name):
+            logging.info("Folder already downloaded and unpacked: %s", folder_name)
+        else:
+            logging.info("Downloading %s", zip_filename)
+            urllib.request.urlretrieve(zip_url, zip_filename)
+            logging.info("Unpacking")
+            shutil.rmtree(folder_name, ignore_errors=True)
+            subprocess.check_call(["unzip", zip_filename])
+        parsed_args.poco_html_docs_folder = folder_name
+
+    # `libxml2` currently has a bug which prevent installing it on macOS
+    # A working workaround:
+    #
+    #   STATIC_DEPS=true LIBXML2_VERSION=2.9.2 pip3 install lxml
+    import lxml.html
+
+    docset_name = "poco.docset"
+    if os.path.exists(docset_name):
+        shutil.rmtree(docset_name)
+    os.mkdir(docset_name)
+
+    contents_path = os.path.join(docset_name, "Contents")
+    os.mkdir(contents_path)
+
+    # Info.plist
+    #
+    # Dash uses 'DocSetPlatformFamily' as search prefix ("poco:")
+    info_path = os.path.join(contents_path, "Info.plist")
+    logging.debug("%s", info_path)
+    open(info_path, "w").write(textwrap.dedent("""\
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                    <key>CFBundleIdentifier</key>
+                    <string>org.pocoproject.poco-dash-docset</string>
+                    <key>CFBundleName</key>
+                    <string>Poco</string>
+                    <key>DashDocSetFallbackURL</key>
+                    <string>http://pocoproject.org/docs/</string>
+                    <key>DashDocSetFamily</key>
+                    <string>dashtoc</string>
+                    <key>DocSetPlatformFamily</key>
+                    <string>poco</string>
+                    <key>dashIndexFilePath</key>
+                    <string>index.html</string>
+                    <key>isDashDocset</key>
+                    <true/>
+                    <key>isJavaScriptEnabled</key>
+                    <true/>
+            </dict>
+            </plist>
+            """))
+
+    res_path = os.path.join(contents_path, "Resources")
+    os.mkdir(res_path)
+
+    doc_path = os.path.join(res_path, "Documents")
+    os.mkdir(doc_path)
+
+    conn = sqlite3.connect(os.path.join(res_path, 'docSet.dsidx'))
+    cur = conn.cursor()
+    cur.execute('CREATE TABLE searchIndex (id integer primary key, name text, type text, path text)')
+    cur.execute('CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path);')
+
+    for src_path, dirs, files in os.walk(parsed_args.poco_html_docs_folder):
+        dst_dir = os.path.relpath(src_path, parsed_args.poco_html_docs_folder)
+        dst_path = os.path.normpath(os.path.join(doc_path, dst_dir))
+        if dst_dir != '.':
+            os.mkdir(dst_path)
+
+        for fn in files:
+            if fn == 'navigation.html':
+                continue
+            srcfile = os.path.join(src_path, fn)
+            dstfile = os.path.join(dst_path, fn)
+            logging.debug("%s", dstfile)
+            if fn.endswith('.html'):
+                et = lxml.html.parse(srcfile)
+                et.find('//div[@id="navigation"]').drop_tree()
+                et.find('//script[@src="js/iframeResizer.min.js"]').drop_tree()
+                lxml.html.etree.SubElement(et.find('//head'), "link", {"rel":"stylesheet","href":"css/styles-override.css","type":"text/css"})
+                titletext = et.find('//title').text
+                
+                if titletext == 'Package Index':
+                    libname = et.find('//h1[@class="category"]').text.replace("Library ","")
+                    pkgname = et.find('//h1[@class="title"]').text.replace("Package ", "")
+                    logging.info('    Package: %s.%s', libname, pkgname)
+                    cur.execute('INSERT INTO searchIndex(type, name, path) values(?, ?, ?)', ['Package', libname+'.'+pkgname, fn])
+                elif titletext.startswith('Class '):
+                    classname = et.find('//h1[@class="symbol"]').text.replace("class ", "")
+                    logging.info('    Class: %s', classname)
+                    cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', ['Class', classname, fn])
+
+                    content_el = et.find('//div[@class="body"]/div[@id="content"]')
+                    member_type = None
+                    for el in content_el:
+                        if el.tag == "h2":
+                            if el.text == "Types":
+                                member_type = "Type"
+                            elif el.text == "Enumerations":
+                                member_type = "Enum"
+                            elif el.text == "Constructors":
+                                member_type = "Constructor"
+                            elif el.text == "Destructor":
+                                member_type = None
+                            elif el.text == "Member Functions":
+                                member_type = "Method"
+                            elif el.text == "Variables":
+                                member_type = "Variable"
+                            elif el.text == "Nested Classes":
+                                member_type = "Class"
+                            else:
+                                member_type = None
+
+                        if member_type and (el.tag == "h3"):
+                            anc = el.find('./a[@id]')
+                            if anc is not None:
+                                logging.info("        %s: %s", member_type, anc.text)
+                                url_anchor = "//apple_ref/cpp/"+member_type+"/"+anc.text
+                                el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
+                                if member_type != "Class":
+                                    cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', [member_type, anc.text, fn + '#' + url_anchor])
+                            else:
+                                anc = el.find('./a[@href]')
+                                if anc is not None:
+                                    if anc.text.startswith("class "):
+                                        ident = anc.text[6:]
+                                    elif anc.text.startswith("struct "):
+                                        ident = anc.text[7:]
+                                    else:
+                                        ident = anc.text
+                                    logging.info("        %s: %s", member_type, ident)
+                                    url_anchor = "//apple_ref/cpp/"+member_type+"/"+ident
+                                    el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
+                                    cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', [member_type, ident, anc.get("href")])
+
+                        if (member_type == "Enum") and (el.tag == "p") and (el.get("class") == "decl"):
+                            anc = el.find('./a[@id]')
+                            if anc is not None:
+                                logging.info("        Option: %s", anc.text)
+                                url_anchor = "//apple_ref/cpp/Option/"+anc.text
+                                el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
+                                cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', ["Option", anc.text, fn + '#' + url_anchor])
+                                
+                elif fn == "index.html":
+                    for el in et.findall('//a[@href]'):
+                        href = el.get("href")
+                        if "http://" in href:
+                            continue
+                        if re.search(r'''^[0-9]{5}''', href) or ("Guide" in href):
+                            cur.execute('INSERT INTO searchIndex(type, name, path) values(?, ?, ?)', ['Guide', el.text, href])
+                        elif href.startswith("Poco.") and (el.text == "Poco" or el.text.startswith("Poco::")):
+                            cur.execute('INSERT INTO searchIndex(type, name, path) values(?, ?, ?)', ['Namespace', el.text, href])
+                    
+                open(dstfile,"wb").write(lxml.html.tostring(et))
+            else:
+                shutil.copyfile(srcfile, dstfile)
+
+    open(os.path.join(doc_path, "css", "styles-override.css"),"w").write(textwrap.dedent("""\
+            #content
+            {
+                left : 0;
+                border-left : none;
+            }
+            """))
+    conn.commit()
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("poco_html_docs_folder", nargs='?')
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity, more than once to be more verbose")
+    parsed_args = parser.parse_args()
+
+    levels = [logging.WARNING, logging.INFO, logging.DEBUG]
+    level = levels[min(len(levels)-1,parsed_args.verbose)]
+    logging.basicConfig(level=level, format="%(message)s")
+    main(parsed_args)
