@@ -130,35 +130,59 @@ def main(parsed_args):
                             else:
                                 member_type = None
 
+                        tag_type = member_type
+                        tag_name = None
+                        tag_indexed = (member_type != "Constructor")
+                        tag_href = None
+
                         if member_type and (el.tag == "h3"):
                             anc = el.find('./a[@id]')
                             if anc is not None:
-                                logging.info("        %s: %s", member_type, anc.text)
-                                url_anchor = "//apple_ref/cpp/"+member_type+"/"+anc.text
-                                el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
-                                if member_type != "Class":
-                                    cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', [member_type, anc.text, fn + '#' + url_anchor])
+                                tag_name = anc.text
+                                if member_type == "Method":
+                                    if (el.find('./img[@alt="static"]') is not None):
+                                        tag_type = "Subroutine" # to have 'S' icon on static methods
+                                    elif (el.find('./img[@alt="protected"]') is not None):
+                                        tag_type = "Procedure" # to have 'P' icon on protected methods
+                                    elif re.match(r'''^operator\W''', tag_name):
+                                        tag_type = "Operator"
+                                elif member_type == "Variable":
+                                    saved_name = tag_name
+                                    tag_name = None # wait for p.decl
                             else:
                                 anc = el.find('./a[@href]')
                                 if anc is not None:
                                     if anc.text.startswith("class "):
-                                        ident = anc.text[6:]
+                                        tag_name = anc.text[6:]
+                                        tag_type = "Class"
                                     elif anc.text.startswith("struct "):
-                                        ident = anc.text[7:]
+                                        tag_name = anc.text[7:]
+                                        tag_type = "Struct"
                                     else:
-                                        ident = anc.text
-                                    logging.info("        %s: %s", member_type, ident)
-                                    url_anchor = "//apple_ref/cpp/"+member_type+"/"+ident
-                                    el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
-                                    cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', [member_type, ident, anc.get("href")])
+                                        tag_name = anc.text
+                                    tag_href = anc.get("href")
 
                         if (member_type == "Enum") and (el.tag == "p") and (el.get("class") == "decl"):
                             anc = el.find('./a[@id]')
                             if anc is not None:
-                                logging.info("        Option: %s", anc.text)
-                                url_anchor = "//apple_ref/cpp/Option/"+anc.text
-                                el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
-                                cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', ["Option", anc.text, fn + '#' + url_anchor])
+                                tag_name = anc.text
+                                tag_type = "Constant"
+
+                        if (member_type == "Variable") and (el.tag == "p") and (el.get("class") == "decl"):
+                            tag_name = saved_name
+                            decltext = "".join(el.itertext())
+                            if re.search(r'''^(static\s|const\s)+''', decltext):
+                                tag_type = "Constant"
+                            else:
+                                tag_type = "Variable"
+
+                        # insert
+                        if tag_name:
+                            logging.info("        %s: %s", tag_type, tag_name)
+                            url_anchor = "//apple_ref/cpp/"+tag_type+"/"+tag_name
+                            el.insert(0, lxml.html.etree.Element("a", {"name":url_anchor,"class":"dashAnchor"}))
+                            if tag_indexed:
+                                cur.execute('INSERT OR IGNORE INTO searchIndex(type, name, path) values(?, ?, ?)', [tag_type, tag_name, (tag_href if tag_href else fn + '#' + url_anchor)])
                                 
                 elif fn == "index.html":
                     for el in et.findall('//a[@href]'):
