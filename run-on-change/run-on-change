@@ -1,0 +1,50 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import subprocess, os, os.path, sys, time
+
+def main(args):
+    if args.command:
+        while True:
+            sys.stdout.write("\x1b[2J\x1b[3J\x1b[H") # clear screen, clear scrollback, move cursor to 0,0
+            sys.stdout.flush()
+            time.sleep(0.1)
+            subprocess.call(args.command, shell=True)
+            print()
+            print('watch: waiting for a change...')
+            watch(['.'])
+            print()
+
+def dir_snapshot(paths):
+    rv = {}
+    for path in paths:
+        if os.path.isdir(path):
+            for dirpath, subdirs, files in os.walk(path):
+                for filename in files:
+                    filepath = os.path.join(dirpath, filename)
+                    try:
+                        rv[filepath] = os.stat(filepath).st_mtime
+                    except FileNotFoundError as ex:
+                        pass
+        else:
+            try:
+                rv[path] = os.stat(path).st_mtime
+            except FileNotFoundError as ex:
+                pass
+    return rv
+
+def watch(paths):
+    snap = dir_snapshot(paths)
+    mysnap = dir_snapshot([os.path.abspath(sys.argv[0])])
+    while True:
+        time.sleep(0.25)
+        if mysnap != dir_snapshot([os.path.abspath(sys.argv[0])]):
+            os.execv(sys.argv[0], sys.argv)
+            assert False, "os.execv() failed, this should never happen"
+        if snap != dir_snapshot(paths): break
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--command", required=True, help="Shell command to execute")
+    args = parser.parse_args()
+    main(args)
